@@ -192,17 +192,19 @@ def predecir_tiempos_ganancia(precios_series, horizon_params, data_lookback_days
     period_label = horizon_params['fetch_period_label']
     future_days_est = horizon_params['future_days']
 
+    # Determine minimum required points based on lookback
     min_data_points = data_lookback_days if data_lookback_days else 20
-    if len(precios_series) < min_data_points:
-        return "N/A", "N/A", 0.0, "N/A", f"Insufficient data ({len(precios_series)} points) for predictive estimation (need {min_data_points})."
+    # Allow prediction if we have at least min_data_points - 1
+    required_points_check = min_data_points -1 if data_lookback_days else min_data_points
+
+    if len(precios_series) < required_points_check:
+        return "N/A", "N/A", 0.0, "N/A", f"Insufficient data ({len(precios_series)} points) for predictive estimation (need at least {required_points_check})."
 
     try:
         current_price = precios_series.iloc[-1]
 
-        if data_lookback_days:
-             lookback_days_actual = min(data_lookback_days, len(precios_series))
-        else:
-             lookback_days_actual = min(horizon_params['days_lookback'] * 2, len(precios_series))
+        # Use the actual number of days available for lookback in calculation
+        lookback_days_actual = min(data_lookback_days if data_lookback_days else len(precios_series), len(precios_series))
 
         x = np.arange(lookback_days_actual)
         y = precios_series.iloc[-lookback_days_actual:].values
@@ -430,40 +432,72 @@ def analizar_mejores_opciones():
     results = []
     short_term_horizon = HORIZON_MAP["Short Term (1 month)"]
     lookback_days_for_top5 = 10
+    days_for_24h_change = 4 # Fetch more days to reliably get the last two closing prices
+    min_pred_days_needed = lookback_days_for_top5 - 1 # Allow prediction if we have at least 9 days for a 10-day request
 
     for name, ticker in TOP_5_CRYPTOS.items():
         print(f"Analyzing {name} ({ticker})...")
-        data_10d = obtener_datos_cripto(ticker, period=f"{lookback_days_for_top5}d", interval="1d")
-        data_2d = obtener_datos_cripto(ticker, period="2d", interval="1d")
+        # Fetch data for prediction (last 10 days)
+        data_pred = obtener_datos_cripto(ticker, period=f"{lookback_days_for_top5}d", interval="1d")
+        # Fetch data for 24h change calculation (last 4 days)
+        data_24h = obtener_datos_cripto(ticker, period=f"{days_for_24h_change}d", interval="1d")
 
-        if data_10d.empty or data_2d.empty or len(data_2d) < 2 or len(data_10d) < lookback_days_for_top5:
-            results.append({
-                "Name": name, "Ticker": ticker, "Price": "N/A", "Change (24h)": "N/A",
-                "Buy Days Est.": "N/A", "Reason": f"Could not fetch sufficient data ({len(data_10d)}/{lookback_days_for_top5} days)."
-            })
-            continue
+        # Initialize default values
+        current_price_str = "N/A"
+        change_24h_str = "N/A"
+        buy_days_est = "N/A"
+        reason = "Could not fetch sufficient data" # Default reason
+        can_predict = False # Flag to check if prediction is possible
 
-        current_price = data_10d['Close'].iloc[-1]
-        price_yesterday = data_2d['Close'].iloc[-2]
-        change_24h = ((current_price - price_yesterday) / price_yesterday) * 100 if price_yesterday else 0
+        # Check if we have enough data for 24h change
+        if not data_24h.empty and len(data_24h) >= 2:
+            current_price = data_24h['Close'].iloc[-1]
+            price_yesterday = data_24h['Close'].iloc[-2]
+            current_price_str = f"${current_price:.2f}"
+            change_24h = ((current_price - price_yesterday) / price_yesterday) * 100 if price_yesterday else 0
+            change_24h_str = f"{change_24h:+.2f}%"
+        else:
+            reason += f" (needed 2 days for 24h change, got {len(data_24h)})"
 
-        _, _, _, buy_days_est, reason = predecir_tiempos_ganancia(data_10d['Close'], short_term_horizon, data_lookback_days=lookback_days_for_top5)
+
+        # Check if we have enough data for prediction (relaxed check)
+        if not data_pred.empty and len(data_pred) >= min_pred_days_needed:
+             # Prediction is possible
+             can_predict = True
+        else:
+            # Update reason if prediction data was insufficient
+             reason += f" (needed {min_pred_days_needed}+ days for prediction, got {len(data_pred)})"
+
+        # Perform prediction only if possible and 24h data was available
+        if can_predict and current_price_str != "N/A":
+             _, _, _, buy_days_est, reason = predecir_tiempos_ganancia(data_pred['Close'], short_term_horizon, data_lookback_days=lookback_days_for_top5)
+        elif can_predict and current_price_str == "N/A":
+             # Update reason if prediction couldn't run due to lack of 24h data for context
+             reason = "Could not calculate 24h change, prediction skipped."
+        # else: reason already contains info about lack of prediction data
+
 
         results.append({
-            "Name": name, "Ticker": ticker, "Price": f"${current_price:.2f}",
-            "Change (24h)": f"{change_24h:+.2f}%", "Buy Days Est.": buy_days_est, "Reason": reason
+            "Name": name,
+            "Ticker": ticker,
+            "Price": current_price_str,
+            "Change (24h)": change_24h_str,
+            "Buy Days Est.": buy_days_est,
+            "Reason": reason
         })
 
-    md_output = f"## 📊 Top 5 Crypto Short-Term Outlook (Speculative - based on last {lookback_days_for_top5} days)\n"
+    md_output = f"## 📊 Top 5 Crypto Short-Term Outlook (Speculative - based on last ~{lookback_days_for_top5} days)\n"
     md_output += "*(Analysis might take a minute...)*\n\n"
-    md_output += "| Name | Ticker | Current Price | Change (24h) | Est. Buy Dip (Days) | Basis |\n"
+    md_output += "| Name | Ticker | Current Price | Change (24h) | Est. Buy Dip (Days) | Basis / Status |\n" # Changed header slightly
     md_output += "|---|---|---|---|---|---|\n"
     for r in results:
-        reason_short = r['Reason'].split('.')[0] + '.' if '.' in r['Reason'] else r['Reason']
+        # Ensure reason is a string before processing
+        reason_str = str(r.get('Reason', ''))
+        reason_short = reason_str.split('.')[0] + '.' if '.' in reason_str else reason_str
         reason_short = (reason_short[:100] + '...') if len(reason_short) > 100 else reason_short
         md_output += f"| {r['Name']} | {r['Ticker']} | {r['Price']} | {r['Change (24h)']} | {r['Buy Days Est.']} | {reason_short} |\n"
 
-    md_output += f"\n*Disclaimer: Analysis based on limited {lookback_days_for_top5}-day data and simple trend estimation. Estimated buy days predict time to reach a potential {PROFIT_TARGET*100:.1f}% lower price based *only* on the downward trend in the lookback period. Highly speculative. Not financial advice.*"
+    md_output += f"\n*Disclaimer: Analysis based on limited ~{lookback_days_for_top5}-day data and simple trend estimation. Estimated buy days predict time to reach a potential {PROFIT_TARGET*100:.1f}% lower price based *only* on the downward trend in the lookback period. Highly speculative. Not financial advice.*"
     print("Top 5 analysis complete.")
     return md_output
 
